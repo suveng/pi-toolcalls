@@ -1,0 +1,42 @@
+{
+  "name": "pi-toolcalls",
+  "version": "0.1.0",
+  "description": "Hide, compact, or reveal tool-call rows in the pi coding agent TUI. One global tool renderer that covers built-in, extension, and MCP tools.",
+  "type": "module",
+  "license": "MIT",
+  "author": "suwenguang",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "tui",
+    "tool-calls",
+    "tool-renderer",
+    "transcript",
+    "display"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/suveng/pi-toolcalls.git"
+  },
+  "homepage": "https://github.com/suveng/pi-toolcalls#readme",
+  "bugs": {
+    "url": "https://github.com/suveng/pi-toolcalls/issues"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  }
+}
