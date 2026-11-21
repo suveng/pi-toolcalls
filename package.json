@@ -1,6 +1,6 @@
 {
   "name": "pi-toolcalls",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Hide, compact, or reveal tool-call rows in the pi coding agent TUI. One global tool renderer that covers built-in, extension, and MCP tools.",
   "type": "module",
   "license": "MIT",
