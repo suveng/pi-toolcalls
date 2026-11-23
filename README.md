@@ -24,8 +24,11 @@ pi install npm:pi-toolcalls
 | 模式 | 效果 |
 | --- | --- |
 | `hidden`（默认） | 工具调用行完全不可见，连错误也不显示。用 `renderShell: "self"` + 空 `Container`，不会留下带背景的空行 |
-| `compact` | 每次调用一行摘要（如 `▸ bash git status`）；失败时多一行红字错误；不显示工具输出 |
+| `compact` | 每次调用一行摘要 + 耗时（如 `▸ bash git status · 1.2s`）；运行中每秒走秒；失败时多一行红字错误；`Ctrl+O`（或点该行）展开输出 |
 | `native` | pi 原生渲染（含输出，`Ctrl+O` 折叠/展开） |
+
+`compact` 的耗时取自 pi 记录的 `context.durationMs`（最终结果才有）；老会话里没有该值
+时回退到渲染器自己的时钟。
 
 ## 用法
 
@@ -49,6 +52,7 @@ PI_TOOL_DISPLAY=compact pi
 ## 注意
 
 - `hidden` 模式下工具失败也看不见。如果想让错误可见，用 `compact`。
+- `compact` 展开的输出上限 400 行 / 40 000 字符，超了会截断并标注。
 - 模式切换立即影响新渲染的行；已经画出来的旧行要等重绘（滚出屏幕再回来，或 `/reload`）。
 
 ## 开发

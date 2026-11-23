@@ -3,13 +3,15 @@
  *
  * Three modes (default: hidden):
  *   hidden   no tool-call rows at all, not even errors — cleanest transcript
- *   compact  one summary line per call, plus one red line when a call fails
+ *   compact  one summary line per call, with the elapsed time appended once it
+ *            finishes (`▸ bash: ls -la · 1.2s`); one red line when a call fails;
+ *            Ctrl+O (or a click on the row) expands the output
  *   native   pi's own rendering (output included, Ctrl+O to fold)
  *
  * Commands:
  *   /toolcalls            show the current mode
  *   /toolcalls hidden     hide tool-call rows (default)
- *   /toolcalls compact    one summary line per call
+ *   /toolcalls compact    one summary line per call (+ elapsed, expandable)
  *   /toolcalls native     restore pi's native rendering
  *   /toolcalls toggle     cycle hidden -> compact -> native
  *
@@ -30,6 +32,36 @@ const CONFIG_PATH = join(getAgentDir(), "tool-display.json");
 
 /** Argument keys that best describe a call, in priority order. */
 const SUMMARY_KEYS = ["command", "path", "file_path", "pattern", "query", "url", "name", "text"];
+
+/** Expanded output is capped so one huge result cannot flood the transcript. */
+const EXPANDED_MAX_LINES = 400;
+const EXPANDED_MAX_CHARS = 40_000;
+
+/** Per-row renderer state, shared between renderCall and renderResult. */
+interface RowState {
+  startedAt?: number;
+  endedAt?: number;
+  interval?: ReturnType<typeof setInterval>;
+  /** Themed `▸ tool` title of the call row. */
+  label?: string;
+  /** One-line description of the call arguments. */
+  summary?: string;
+  /** The call row component, so the final timing can be folded into that line. */
+  callText?: Text;
+}
+
+type Theme = {
+  fg(color: string, text: string): string;
+};
+
+type RenderContext = {
+  state: RowState;
+  durationMs?: number;
+  isPartial?: boolean;
+  expanded?: boolean;
+  executionStarted?: boolean;
+  invalidate?: () => void;
+};
 
 function isMode(value: unknown): value is Mode {
   return typeof value === "string" && (MODES as string[]).includes(value);
@@ -74,6 +106,20 @@ function summarize(args: Record<string, unknown> | undefined): string {
   return "";
 }
 
+/** `840ms`, `4.2s`, `1m 30s`, `2h 3m`. */
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const restSeconds = Math.round(seconds - minutes * 60);
+  if (minutes < 60) return restSeconds ? `${minutes}m ${restSeconds}s` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const restMinutes = minutes - hours * 60;
+  return restMinutes ? `${hours}h ${restMinutes}m` : `${hours}h`;
+}
+
 /** First non-empty text line of a tool result, used for the compact error row. */
 function firstLine(result: unknown): string {
   const content = (result as { content?: Array<{ type?: string; text?: string }> } | undefined)
@@ -83,6 +129,46 @@ function firstLine(result: unknown): string {
   if (!block?.text) return "";
   const line = block.text.split("\n").find((item) => item.trim()) ?? "";
   return shorten(line, 100);
+}
+
+/** Full text output, capped, for the expanded row. */
+function outputText(result: unknown): string {
+  const content = (result as { content?: Array<{ type?: string; text?: string }> } | undefined)
+    ?.content;
+  if (!Array.isArray(content)) return "";
+  const text = content
+    .filter((item) => item?.type === "text" && typeof item.text === "string")
+    .map((item) => item.text as string)
+    .join("\n")
+    .replace(/\s+$/, "");
+  if (!text) return "";
+  const lines = text.split("\n");
+  if (lines.length > EXPANDED_MAX_LINES) {
+    lines.length = EXPANDED_MAX_LINES;
+    lines.push(`… output truncated at ${EXPANDED_MAX_LINES} lines`);
+  }
+  const joined = lines.join("\n");
+  return joined.length > EXPANDED_MAX_CHARS
+    ? `${joined.slice(0, EXPANDED_MAX_CHARS)}\n… output truncated at ${EXPANDED_MAX_CHARS} chars`
+    : joined;
+}
+
+function stopTimer(state: RowState): void {
+  if (state.interval) {
+    clearInterval(state.interval);
+    state.interval = undefined;
+  }
+}
+
+/** Rebuild the call row with `· 4.2s` appended. No-op without a duration. */
+function applyTiming(state: RowState, theme: Theme, durationMs: number | undefined): void {
+  if (!state.callText || durationMs === undefined) return;
+  const suffix = formatDuration(durationMs);
+  if (!suffix) return;
+  const base = state.summary
+    ? `${state.label ?? ""} ${theme.fg("dim", state.summary)}`
+    : (state.label ?? "");
+  state.callText.setText(`${base} ${theme.fg("dim", `· ${suffix}`)}`);
 }
 
 export default function piToolcalls(pi: ExtensionAPI): void {
@@ -102,21 +188,66 @@ export default function piToolcalls(pi: ExtensionAPI): void {
       };
     }
 
-    // compact: one summary line; one error line on failure; never the output.
     return {
-      renderCall(args, theme) {
-        if (mode === "hidden") return new Container();
+      renderCall(args, theme, context) {
+        const state = (context as unknown as RenderContext).state;
+        const themed = theme as Theme;
+        if (state && state.startedAt === undefined) state.startedAt = Date.now();
         const summary = summarize(args as Record<string, unknown>);
-        const label = theme.fg("toolTitle", `▸ ${toolName}`);
-        return new Text(summary ? `${label} ${theme.fg("dim", summary)}` : label, 0, 0);
-      },
-      renderResult(result, _options, theme, context) {
-        if (mode === "hidden") return new Container();
-        if (context?.isError) {
-          const detail = firstLine(result);
-          const head = theme.fg("error", `✗ ${toolName}`);
-          return new Text(detail ? `${head} ${theme.fg("dim", detail)}` : head, 0, 0);
+        // While the call runs, redraw once a second so the elapsed time climbs.
+        if (state && !state.interval && !state.endedAt && context.executionStarted) {
+          state.interval = setInterval(() => {
+            if (!state.endedAt) context.invalidate?.();
+            else stopTimer(state);
+          }, 1000);
         }
+        const label = themed.fg("toolTitle", `▸ ${toolName}`);
+        if (state) {
+          state.label = label;
+          state.summary = summary;
+        }
+        // While running, show the elapsed time climbing on the same line.
+        const running = state?.startedAt !== undefined && state.endedAt === undefined;
+        const elapsed = running ? formatDuration(Date.now() - (state!.startedAt as number)) : "";
+        const parts = [summary ? `${label} ${themed.fg("dim", summary)}` : label];
+        if (elapsed) parts.push(themed.fg("dim", `· ${elapsed}`));
+        const text = new Text(parts.join(" "), 0, 0);
+        if (state) state.callText = text;
+        return text;
+      },
+
+      renderResult(result, options, theme, context) {
+        const row = context as unknown as RenderContext;
+        const themed = theme as Theme;
+        const state = row.state ?? {};
+        const partial = row.isPartial ?? options.isPartial;
+
+        // Duration: prefer pi's recorded value, fall back to our own clock.
+        let durationMs = row.durationMs;
+        if (!partial) {
+          if (state.endedAt === undefined) state.endedAt = Date.now();
+          stopTimer(state);
+          if (durationMs === undefined && state.startedAt !== undefined) {
+            durationMs = state.endedAt - state.startedAt;
+          }
+        }
+
+        // The final timing replaces the running clock on the call row.
+        applyTiming(state, themed, durationMs);
+
+        // Expanded: the call line stays as the header, the output follows indented.
+        if (options.expanded) {
+          const body = outputText(result);
+          return body ? new Text(themed.fg("dim", body), 2, 0) : new Container();
+        }
+
+        if ((context as { isError?: boolean }).isError) {
+          const detail = firstLine(result);
+          const head = themed.fg("error", `✗ ${toolName}`);
+          return new Text(detail ? `${head} ${themed.fg("dim", detail)}` : head, 0, 0);
+        }
+
+        // Success: the whole row stays one line.
         return new Container();
       },
     };
@@ -152,7 +283,7 @@ export default function piToolcalls(pi: ExtensionAPI): void {
         mode === "hidden"
           ? "Tool-call rows hidden (errors included). Use /toolcalls compact or native to bring them back."
           : mode === "compact"
-            ? "One summary line per call; failures show one error line; output stays hidden."
+            ? "One line per call with elapsed time; failures show one error line; Ctrl+O expands output."
             : "Native pi rendering restored (output included, Ctrl+O to fold).";
       ctx.ui.notify(hint, "info");
       ctx.ui.setStatus("toolcalls", `tools: ${mode}`);
